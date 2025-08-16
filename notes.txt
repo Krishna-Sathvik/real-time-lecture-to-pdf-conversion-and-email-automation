@@ -1,0 +1,275 @@
+ffmpeg -list_devices true -f dshow -i dummy
+
+
+facebook/wav2vec2-large-960h-lv60-self
+jonatasgrosman/wav2vec2-large-xlsr-53-english
+
+Component	             Purpose
+SpeexDSP (via ctypes)	   Noise Suppression (Removes 				  background noise)
+SpeechBrain MetricGAN+	  Speech Enhancement (Improves 				  clarity)
+Facebook Wav2Vec2	  Speech-to-Text Conversion
+Multilingual Punctuation	Restores proper 					punctuation
+
+
+
+
+
+
+
+
+
+
+
+import torch
+import librosa
+import noisereduce as nr
+from deepmultilingualpunctuation import PunctuationModel
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+# Load Wav2Vec2 Model
+MODEL_NAME = "jonatasgrosman/wav2vec2-large-xlsr-53-english"
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME)
+
+# Load Punctuation Model
+punctuation_model = PunctuationModel()
+
+def transcribe_audio(audio_path):
+    # Load the audio file (ensure it is at 16kHz)
+    speech_array, sr = librosa.load(audio_path, sr=16000)
+
+    # Apply noise reduction (reduces noise but keeps speech clear)
+    speech_array = nr.reduce_noise(y=speech_array, sr=sr, prop_decrease=0.8)
+
+    # Process and transcribe
+    input_values = processor(speech_array, return_tensors="pt", sampling_rate=16000).input_values
+    with torch.no_grad():
+        logits = model(input_values).logits
+
+    # Convert to text
+    predicted_ids = torch.argmax(logits, dim=-1)
+    raw_transcription = processor.batch_decode(predicted_ids)[0]
+
+    # Restore punctuation
+    punctuated_transcription = punctuation_model.restore_punctuation(raw_transcription)
+
+    return punctuated_transcription
+
+if __name__ == "__main__":
+    transcribed_text = transcribe_audio("data/audio/lecture_audio.wav")
+    print("Transcribed Text with Punctuation:\n", transcribed_text)
+
+
+
+
+
+
+
+
+
+import torch
+import librosa
+import torchaudio
+import numpy as np
+import ctypes
+import soundfile as sf
+from deepmultilingualpunctuation import PunctuationModel
+from speechbrain.inference import SpectralMaskEnhancement
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+# Load Wav2Vec2 Model
+MODEL_NAME = "facebook/wav2vec2-large-960h-lv60-self"
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME).to("cpu")
+
+# Load Speech Enhancement Model
+enhancer = SpectralMaskEnhancement.from_hparams(
+    source="speechbrain/metricgan-plus-voicebank", savedir="tmp"
+).to("cpu")
+
+# Load Punctuation Model
+punctuation_model = PunctuationModel()
+
+# Load SpeexDSP Library (Ensure the path is correct)
+speex_dll = ctypes.CDLL("C:/vcpkg/installed/x64-windows/bin/libspeexdsp.dll")
+
+# Define Speex Constants
+FRAME_SIZE = 160
+SAMPLE_RATE = 16000
+
+# Initialize Speex Noise Suppression
+speex_dll.speex_preprocess_state_init.restype = ctypes.c_void_p
+speex_dll.speex_preprocess_ctl.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+speex_dll.speex_preprocess_run.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_short)]
+
+ns_state = speex_dll.speex_preprocess_state_init(FRAME_SIZE, SAMPLE_RATE)
+if not ns_state:
+    raise RuntimeError("Failed to initialize Speex Noise Suppression.")
+
+def speex_noise_suppress(audio_data):
+    """Applies Speex noise suppression for better clarity."""
+    num_frames = len(audio_data) // FRAME_SIZE
+    processed_audio = np.zeros_like(audio_data, dtype=np.int16)
+
+    for i in range(num_frames):
+        frame = np.ascontiguousarray(audio_data[i * FRAME_SIZE:(i + 1) * FRAME_SIZE], dtype=np.int16)
+        frame_ptr = frame.ctypes.data_as(ctypes.POINTER(ctypes.c_short))
+        speex_dll.speex_preprocess_run(ns_state, frame_ptr)
+        processed_audio[i * FRAME_SIZE:(i + 1) * FRAME_SIZE] = np.frombuffer(frame, dtype=np.int16)
+    
+    return processed_audio.astype(np.float32).flatten()  # Ensure it remains a 1D array
+
+def preprocess_audio(audio_path, save_path="data/audio/enhanced_audio.wav"):
+    """Loads audio, applies noise suppression, enhancement, and saves for manual inspection."""
+
+    # Load audio using librosa
+    speech_array, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
+
+    # Apply Speex noise suppression
+    speech_array = speex_noise_suppress(speech_array)
+
+    # Convert to Tensor for enhancement
+    speech_tensor = torch.tensor(speech_array).unsqueeze(0)
+
+    # Enhance the audio using SpeechBrain MetricGAN+
+    with torch.no_grad():
+        enhanced_audio = enhancer.enhance_batch(speech_tensor).squeeze(0).numpy()
+
+    # Save the enhanced audio for manual listening
+    sf.write(save_path, enhanced_audio, sr)
+    print(f"Enhanced audio saved to: {save_path}")
+
+    return enhanced_audio
+
+def transcribe_audio(audio_path):
+    """Transcribes the given audio with punctuation restoration."""
+    speech_array = preprocess_audio(audio_path)
+    input_values = processor(speech_array, return_tensors="pt", sampling_rate=SAMPLE_RATE).input_values
+    with torch.no_grad():
+        logits = model(input_values).logits
+    predicted_ids = torch.argmax(logits, dim=-1)
+    raw_transcription = processor.batch_decode(predicted_ids)[0]
+    return punctuation_model.restore_punctuation(raw_transcription)
+
+if __name__ == "__main__":
+    transcribed_text = transcribe_audio("data/audio/lecture_audio.wav")
+    print("Transcribed Text with Punctuation:\n", transcribed_text)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def transcribe_audio(audio_path):
+    """Transcribes speech with punctuation restoration."""
+    speech_array = preprocess_audio(audio_path)
+
+    # Skip silent or very low volume audio
+    if np.max(np.abs(speech_array)) < 0.01:
+        return "No speech detected or transcription failed."
+
+    # Process and transcribe
+    input_values = processor(speech_array, return_tensors="pt", sampling_rate=SAMPLE_RATE).input_values
+    with torch.no_grad():
+        logits = model(input_values).logits
+
+    # Convert to text
+    predicted_ids = torch.argmax(logits, dim=-1)
+    raw_transcription = processor.batch_decode(predicted_ids)[0]
+
+    # Debugging Output
+    print("\nRaw Transcription Before Punctuation:\n", raw_transcription)
+
+    if not raw_transcription.strip():
+        return "No speech detected or transcription failed."
+
+    # Restore punctuation
+    return punctuation_model.restore_punctuation(raw_transcription)
+
+
+
+
+
+
+
+
+
+
+import librosa
+import soundfile as sf
+import torch
+import numpy as np
+import ctypes
+from deepmultilingualpunctuation import PunctuationModel
+from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+
+# Load Wav2Vec2 Model
+MODEL_NAME = "facebook/wav2vec2-large-960h-lv60-self"
+processor = Wav2Vec2Processor.from_pretrained(MODEL_NAME)
+model = Wav2Vec2ForCTC.from_pretrained(MODEL_NAME).to("cpu")
+
+# Load Punctuation Model
+punctuation_model = PunctuationModel()
+
+# Load SpeexDSP Library (If noise reduction needs to be applied here)
+speex_dll = ctypes.CDLL("C:/vcpkg/installed/x64-windows/bin/libspeexdsp.dll")
+
+# SpeexDSP Constants
+FRAME_SIZE = 160
+SAMPLE_RATE = 16000
+
+# Initialize Speex Noise Suppression (if applied here)
+speex_dll.speex_preprocess_state_init.restype = ctypes.c_void_p
+speex_dll.speex_preprocess_run.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_short)]
+ns_state = speex_dll.speex_preprocess_state_init(FRAME_SIZE, SAMPLE_RATE)
+if not ns_state:
+    raise RuntimeError("❌ Failed to initialize Speex Noise Suppression.")
+
+def transcribe_audio(audio_path):
+    """Transcribes audio using Wav2Vec2 and applies punctuation restoration."""
+    speech_array, sr = librosa.load(audio_path, sr=SAMPLE_RATE)
+
+    # Debugging info
+    print(f"📌 Loaded audio: {audio_path}")
+    print(f"🎙️ Sample Rate: {sr}")
+    print(f"📏 Duration: {len(speech_array) / sr:.2f} seconds")
+    print(f"🔊 Max Amplitude: {max(speech_array):.4f}")
+    
+    if len(speech_array) == 0:
+        print("❌ Error: Audio is empty!")
+        return ""
+
+    input_values = processor(speech_array, return_tensors="pt", sampling_rate=16000).input_values
+
+    with torch.no_grad():
+        logits = model(input_values).logits
+
+    predicted_ids = torch.argmax(logits, dim=-1)
+    raw_transcription = processor.batch_decode(predicted_ids)[0]
+
+    print("\n📝 Raw Transcription Before Punctuation:\n", raw_transcription)
+
+    if len(raw_transcription.strip()) == 0:
+        print("❌ Error: No speech detected after transcription!")
+        return ""
+
+    # Apply punctuation restoration
+    transcribed_text = punctuation_model.restore_punctuation(raw_transcription)
+    
+    return transcribed_text
+
+if __name__ == "__main__":
+    audio_path = "data/audio/cleaned_audio.wav"  # ✅ Uses noise-reduced audio from `noise_reduction.py`
+    
+    # Process & Transcribe
+    transcribed_text = transcribe_audio(audio_path)
+    
+    print("\n✅ Final Transcription with Punctuation:\n", transcribed_text)
